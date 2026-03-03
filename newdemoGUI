@@ -1,0 +1,235 @@
+import os
+import time
+import threading
+import paho.mqtt.client as mqtt
+import pygame
+
+# ---------------- MQTT CONFIG ----------------
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+DIST_TOPIC = os.getenv("MQTT_DIST_TOPIC", "smartspace/distance_cm")
+CMD_TOPIC = os.getenv("MQTT_CMD_TOPIC", "smartspace/cmd")
+# --------------------------------------------
+
+# ---------------- UI CONFIG -----------------
+WIN_W, WIN_H = 900, 520
+FPS = 30
+# --------------------------------------------
+
+distance_cm = None
+distance_lock = threading.Lock()
+
+def on_message(client, userdata, msg):
+    global distance_cm
+    try:
+        val = float(msg.payload.decode().strip())
+        with distance_lock:
+            distance_cm = val
+    except:
+        pass
+
+# ---------- Simple UI Button ----------
+class Button:
+    def __init__(self, rect, label, on_click):
+        self.rect = pygame.Rect(rect)
+        self.label = label
+        self.on_click = on_click
+
+    def draw(self, screen, font):
+        pygame.draw.rect(screen, (240, 240, 240), self.rect, border_radius=10)
+        pygame.draw.rect(screen, (60, 60, 60), self.rect, 2, border_radius=10)
+        txt = font.render(self.label, True, (20, 20, 20))
+        screen.blit(txt, txt.get_rect(center=self.rect.center))
+
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.rect.collidepoint(event.pos):
+                self.on_click()
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+def main():
+    # MQTT
+    client = mqtt.Client(client_id="jetson-smartspace-gui")
+    client.on_message = on_message
+    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    client.subscribe(DIST_TOPIC, qos=0)
+    client.loop_start()
+
+    def publish_cmd(payload: str):
+        client.publish(CMD_TOPIC, payload, qos=0, retain=False)
+        print(f"[CMD] {payload}")
+
+    # Pygame init
+    pygame.init()
+    screen = pygame.display.set_mode((WIN_W, WIN_H))
+    pygame.display.set_caption("Smart Space – GUI Automation")
+    font_big = pygame.font.SysFont("Arial", 34)
+    font = pygame.font.SysFont("Arial", 24)
+    font_small = pygame.font.SysFont("Arial", 18)
+    clock = pygame.time.Clock()
+
+    # Thresholds (cm)
+    near_th = 30
+    mid_th = 80
+
+    # Automation state
+    auto_mode = True
+    last_auto_sent = {"light": None, "fan": None}
+    last_auto_time = 0.0
+    AUTO_COOLDOWN_S = 1.0  # avoid spamming MQTT
+
+    # Helper: Determine zone
+    def zone(cm):
+        if cm is None:
+            return "NO_SIGNAL"
+        if cm < near_th:
+            return "NEAR"
+        if cm < mid_th:
+            return "MID"
+        return "FAR"
+
+    # Buttons
+    buttons = []
+
+    # Threshold controls
+    def near_minus():
+        nonlocal near_th
+        near_th = clamp(near_th - 5, 5, mid_th - 5)
+
+    def near_plus():
+        nonlocal near_th
+        near_th = clamp(near_th + 5, 5, mid_th - 5)
+
+    def mid_minus():
+        nonlocal mid_th
+        mid_th = clamp(mid_th - 5, near_th + 5, 300)
+
+    def mid_plus():
+        nonlocal mid_th
+        mid_th = clamp(mid_th + 5, near_th + 5, 300)
+
+    # Manual controls
+    def light_on():  publish_cmd("LIGHT:ON")
+    def light_off(): publish_cmd("LIGHT:OFF")
+    def fan_on():    publish_cmd("FAN:ON")
+    def fan_off():   publish_cmd("FAN:OFF")
+
+    def toggle_auto():
+        nonlocal auto_mode
+        auto_mode = not auto_mode
+
+    # Layout
+    # Threshold blocks
+    buttons += [
+        Button((40, 170, 60, 45), "-5", near_minus),
+        Button((210, 170, 60, 45), "+5", near_plus),
+        Button((40, 270, 60, 45), "-5", mid_minus),
+        Button((210, 270, 60, 45), "+5", mid_plus),
+    ]
+
+    # Manual blocks
+    buttons += [
+        Button((360, 170, 140, 50), "LIGHT ON", light_on),
+        Button((520, 170, 140, 50), "LIGHT OFF", light_off),
+        Button((360, 240, 140, 50), "FAN ON", fan_on),
+        Button((520, 240, 140, 50), "FAN OFF", fan_off),
+        Button((360, 310, 300, 55), "TOGGLE AUTO", toggle_auto),
+    ]
+
+    running = True
+    try:
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                for b in buttons:
+                    b.handle_event(event)
+
+            with distance_lock:
+                cm = distance_cm
+
+            z = zone(cm)
+
+            # -------- AUTO RULES (edit as you like) ----------
+            # Example smart automation:
+            # - NEAR  : LIGHT ON, FAN ON
+            # - MID   : LIGHT ON, FAN OFF
+            # - FAR   : LIGHT OFF, FAN OFF
+            now = time.time()
+            if auto_mode and (now - last_auto_time) > AUTO_COOLDOWN_S and z != "NO_SIGNAL":
+                if z == "NEAR":
+                    desired = {"light": "ON", "fan": "ON"}
+                elif z == "MID":
+                    desired = {"light": "ON", "fan": "OFF"}
+                else:
+                    desired = {"light": "OFF", "fan": "OFF"}
+
+                # publish only if changed
+                if desired["light"] != last_auto_sent["light"]:
+                    publish_cmd(f"LIGHT:{desired['light']}")
+                    last_auto_sent["light"] = desired["light"]
+                    last_auto_time = now
+                if desired["fan"] != last_auto_sent["fan"]:
+                    publish_cmd(f"FAN:{desired['fan']}")
+                    last_auto_sent["fan"] = desired["fan"]
+                    last_auto_time = now
+            # ------------------------------------------------
+
+            # ---------- Draw UI ----------
+            # Background color by zone
+            if z == "NO_SIGNAL":
+                screen.fill((25, 25, 25))
+            elif z == "NEAR":
+                screen.fill((110, 0, 0))
+            elif z == "MID":
+                screen.fill((110, 80, 0))
+            else:
+                screen.fill((0, 70, 0))
+
+            # Header
+            title = font_big.render("Smart Space – Distance Automation GUI", True, (255, 255, 255))
+            screen.blit(title, (40, 25))
+
+            # Distance display
+            dist_text = "Distance: --.- cm" if cm is None else f"Distance: {cm:.1f} cm"
+            dt = font_big.render(dist_text, True, (255, 255, 255))
+            screen.blit(dt, (40, 80))
+
+            # Zone display
+            zt = font.render(f"Zone: {z}", True, (255, 255, 255))
+            screen.blit(zt, (40, 125))
+
+            # Threshold box
+            pygame.draw.rect(screen, (255, 255, 255), (30, 155, 280, 190), 2, border_radius=14)
+            screen.blit(font.render("Thresholds (cm)", True, (255, 255, 255)), (45, 160))
+            screen.blit(font.render(f"NEAR < {near_th}", True, (255, 255, 255)), (45, 220))
+            screen.blit(font.render(f"MID  < {mid_th}", True, (255, 255, 255)), (45, 320))
+            screen.blit(font_small.render("Rule: NEAR < near_th, MID < mid_th, else FAR", True, (230, 230, 230)), (45, 355))
+
+            # Automation box
+            pygame.draw.rect(screen, (255, 255, 255), (340, 155, 360, 220), 2, border_radius=14)
+            screen.blit(font.render("Controls", True, (255, 255, 255)), (355, 160))
+
+            # Auto mode indicator
+            auto_label = "AUTO: ON" if auto_mode else "AUTO: OFF (Manual)"
+            auto_color = (255, 255, 255)
+            screen.blit(font.render(auto_label, True, auto_color), (355, 385))
+            screen.blit(font_small.render(f"MQTT cmd topic: {CMD_TOPIC}", True, (230, 230, 230)), (355, 415))
+            screen.blit(font_small.render(f"MQTT dist topic: {DIST_TOPIC}", True, (230, 230, 230)), (355, 438))
+
+            # Draw buttons
+            for b in buttons:
+                b.draw(screen, font)
+
+            pygame.display.flip()
+            clock.tick(FPS)
+
+    finally:
+        client.loop_stop()
+        client.disconnect()
+        pygame.quit()
+
+if __name__ == "__main__":
+    main()
