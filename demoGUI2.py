@@ -1,3 +1,7 @@
+# src/smartspace_gui_publisher.py
+# Jetson Nano: HC-SR04 (GPIO) -> MQTT publish distance + Tkinter GUI + simple smart automation
+# Fix: uses tk.Spinbox (NOT ttk.Spinbox) for compatibility with older Tk versions.
+
 import os
 import time
 import statistics
@@ -20,13 +24,9 @@ ECHO_BCM = int(os.getenv("ECHO_BCM", "24"))  # physical pin 18 (via divider)
 
 # -------------- SENSOR SETTINGS --------------
 PUBLISH_HZ = float(os.getenv("PUBLISH_HZ", "10"))  # measurements per sec
-SAMPLES = int(os.getenv("SAMPLES", "5"))          # median filter
+SAMPLES = int(os.getenv("SAMPLES", "5"))          # median filter samples
 MAX_CM = float(os.getenv("MAX_CM", "400"))
 TIMEOUT_S = float(os.getenv("TIMEOUT_S", "0.03"))  # 30ms timeout
-
-# -------------- AUTOMATION DEFAULTS ----------
-near_th = int(os.getenv("NEAR_TH", "30"))
-mid_th = int(os.getenv("MID_TH", "80"))
 
 # Shared data (sensor -> GUI)
 latest_cm = None
@@ -38,19 +38,19 @@ def measure_cm():
     GPIO.output(TRIG_BCM, GPIO.LOW)
     time.sleep(0.0002)
 
-    # 10us pulse
+    # 10us trigger pulse
     GPIO.output(TRIG_BCM, GPIO.HIGH)
     time.sleep(0.00001)
     GPIO.output(TRIG_BCM, GPIO.LOW)
 
-    # wait for ECHO high
+    # Wait for ECHO to go HIGH
     start_wait = time.time()
     while GPIO.input(ECHO_BCM) == 0:
         if time.time() - start_wait > TIMEOUT_S:
             return None
     pulse_start = time.time()
 
-    # wait for ECHO low
+    # Wait for ECHO to go LOW
     while GPIO.input(ECHO_BCM) == 1:
         if time.time() - pulse_start > TIMEOUT_S:
             return None
@@ -62,17 +62,17 @@ def measure_cm():
         return None
     return min(cm, MAX_CM)
 
-def get_zone(cm, near_val, mid_val):
+def get_zone(cm, near_th, mid_th):
     if cm is None:
         return "NO_SIGNAL"
-    if cm < near_val:
+    if cm < near_th:
         return "NEAR"
-    if cm < mid_val:
+    if cm < mid_th:
         return "MID"
     return "FAR"
 
 def main():
-    global near_th, mid_th, latest_cm, latest_zone
+    global latest_cm, latest_zone
 
     # ---- GPIO init ----
     GPIO.setmode(GPIO.BCM)
@@ -91,11 +91,14 @@ def main():
     # ---- Tkinter GUI ----
     root = tk.Tk()
     root.title("Smart Space – Jetson Nano (HC-SR04 + MQTT + Tkinter)")
-    root.geometry("520x420")
+    root.geometry("540x440")
     root.configure(bg="#222222")
 
     style = ttk.Style()
-    style.theme_use("default")
+    try:
+        style.theme_use("default")
+    except:
+        pass
     style.configure("TLabel", background="#222222", foreground="white")
     style.configure("TButton", padding=6)
 
@@ -114,32 +117,31 @@ def main():
 
     ttk.Label(root, textvariable=mqtt_var, font=("Arial", 10)).pack(pady=2)
 
-    # Threshold controls
+    # Threshold controls (use tk.Spinbox for compatibility)
     thresh_frame = tk.Frame(root, bg="#222222")
     thresh_frame.pack(pady=10)
 
-    near_var = tk.IntVar(value=near_th)
-    mid_var = tk.IntVar(value=mid_th)
+    near_var = tk.IntVar(value=int(os.getenv("NEAR_TH", "30")))
+    mid_var = tk.IntVar(value=int(os.getenv("MID_TH", "80")))
 
     def enforce_thresholds(*_):
-        # keep near < mid
-        n = near_var.get()
-        m = mid_var.get()
+        n = int(near_var.get())
+        m = int(mid_var.get())
         if n >= m:
             mid_var.set(n + 5)
 
     near_var.trace_add("write", enforce_thresholds)
     mid_var.trace_add("write", enforce_thresholds)
 
-    ttk.Label(thresh_frame, text="NEAR threshold (cm):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-    near_spin = ttk.Spinbox(thresh_frame, from_=5, to=200, increment=5, textvariable=near_var, width=8)
+    ttk.Label(thresh_frame, text="NEAR threshold (cm):").grid(row=0, column=0, sticky="w", padx=5, pady=6)
+    near_spin = tk.Spinbox(thresh_frame, from_=5, to=200, increment=5, textvariable=near_var, width=8)
     near_spin.grid(row=0, column=1, padx=5)
 
-    ttk.Label(thresh_frame, text="MID threshold (cm):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-    mid_spin = ttk.Spinbox(thresh_frame, from_=10, to=400, increment=5, textvariable=mid_var, width=8)
+    ttk.Label(thresh_frame, text="MID threshold (cm):").grid(row=1, column=0, sticky="w", padx=5, pady=6)
+    mid_spin = tk.Spinbox(thresh_frame, from_=10, to=400, increment=5, textvariable=mid_var, width=8)
     mid_spin.grid(row=1, column=1, padx=5)
 
-    # Automation mode
+    # Auto mode
     auto_mode = tk.BooleanVar(value=True)
     ttk.Checkbutton(root, text="AUTO mode (send LIGHT/FAN based on zone)", variable=auto_mode).pack(pady=10)
 
@@ -152,16 +154,16 @@ def main():
     ttk.Button(btn_frame, text="FAN ON", command=lambda: publish_cmd("FAN:ON")).grid(row=1, column=0, padx=6, pady=6)
     ttk.Button(btn_frame, text="FAN OFF", command=lambda: publish_cmd("FAN:OFF")).grid(row=1, column=1, padx=6, pady=6)
 
-    # Status footer
-    footer_var = tk.StringVar(value=f"DIST TOPIC: {DIST_TOPIC} | CMD TOPIC: {CMD_TOPIC}")
-    ttk.Label(root, textvariable=footer_var, font=("Arial", 9)).pack(pady=12)
+    # Footer
+    footer_var = tk.StringVar(value=f"DIST: {DIST_TOPIC}   |   CMD: {CMD_TOPIC}")
+    ttk.Label(root, textvariable=footer_var, font=("Arial", 9)).pack(pady=14)
 
-    # AUTO anti-spam state
+    # AUTO anti-spam
     last_sent = {"light": None, "fan": None}
     last_auto_time = 0.0
     AUTO_COOLDOWN_S = 1.0
 
-    # ---- Background worker: sensor read + mqtt publish ----
+    # Background worker thread (sensor -> mqtt + GUI state)
     stop_event = threading.Event()
 
     def worker():
@@ -169,7 +171,6 @@ def main():
         period = 1.0 / max(PUBLISH_HZ, 1e-6)
 
         while not stop_event.is_set():
-            # take multiple samples and median filter
             readings = []
             for _ in range(SAMPLES):
                 cm = measure_cm()
@@ -180,22 +181,19 @@ def main():
             cm_med = None
             if readings:
                 cm_med = statistics.median(readings)
-
-            # publish distance
-            if cm_med is not None:
                 payload = f"{cm_med:.1f}"
                 client.publish(DIST_TOPIC, payload, qos=0, retain=False)
                 print(f"[DIST] {payload} cm")
             else:
                 print("[DIST] No valid reading (timeout).")
 
-            # update shared state for GUI
-            z = get_zone(cm_med, near_var.get(), mid_var.get())
+            z = get_zone(cm_med, int(near_var.get()), int(mid_var.get()))
             with data_lock:
+                global latest_cm, latest_zone
                 latest_cm = cm_med
                 latest_zone = z
 
-            # AUTO rules (optional)
+            # AUTO rules
             now = time.time()
             if auto_mode.get() and z != "NO_SIGNAL" and (now - last_auto_time) > AUTO_COOLDOWN_S:
                 if z == "NEAR":
@@ -217,12 +215,10 @@ def main():
 
             time.sleep(period)
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+    threading.Thread(target=worker, daemon=True).start()
 
-    # ---- GUI updater ----
+    # GUI refresh loop
     def refresh_ui():
-        # read shared state
         with data_lock:
             cm = latest_cm
             z = latest_zone
@@ -233,18 +229,21 @@ def main():
             dist_var.set(f"Distance: {cm:.1f} cm")
         zone_var.set(f"Zone: {z}")
 
-        # change background color by zone
+        # background by zone
         if z == "NEAR":
-            root.configure(bg="#7a0000")
+            bg = "#7a0000"
         elif z == "MID":
-            root.configure(bg="#7a5a00")
+            bg = "#7a5a00"
         elif z == "FAR":
-            root.configure(bg="#005a00")
+            bg = "#005a00"
         else:
-            root.configure(bg="#222222")
+            bg = "#222222"
 
-        # keep ttk labels background in sync
-        style.configure("TLabel", background=root["bg"], foreground="white")
+        root.configure(bg=bg)
+        # keep frame backgrounds in sync
+        thresh_frame.configure(bg=bg)
+        btn_frame.configure(bg=bg)
+        style.configure("TLabel", background=bg, foreground="white")
 
         root.after(150, refresh_ui)
 
@@ -259,7 +258,6 @@ def main():
     try:
         root.mainloop()
     finally:
-        # cleanup
         stop_event.set()
         client.loop_stop()
         client.disconnect()
